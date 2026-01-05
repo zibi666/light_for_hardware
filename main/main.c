@@ -266,9 +266,18 @@ void app_main(void)
                         // 位置越界状态
                         if (data_len == 1) {
                             uint8_t status = data_ptr[0];
-                            if (status == 0x00) printf("状态: 目标在范围外\n");
-                            else if (status == 0x01) printf("状态: 目标在范围内\n");
-                            else printf("状态: 越界未知 (%02X)\n", status);
+                            if (status == 0x00) {
+                                printf("状态: 目标在范围外，清零生命体征缓存\n");
+                                g_motion_index = 0.0f;
+                                g_motion_accum = 0.0f;
+                                g_motion_samples = 0;
+                                g_breathing_rate = 0;
+                                g_heart_rate = 0;
+                            } else if (status == 0x01) {
+                                printf("状态: 目标在范围内\n");
+                            } else {
+                                printf("状态: 越界未知 (%02X)\n", status);
+                            }
                         }
                     } else if (ctrl == CTRL_SLEEP) {
                         if (cmd == CMD_SLEEP_COMPREHENSIVE) {
