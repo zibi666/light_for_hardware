@@ -5,7 +5,7 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.port": "/dev/ttyACM0",
+  "idf.port": "/dev/ttyUSB0",
   "idf.toolsPath": "/home/lm/.espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
@@ -16,5 +16,5 @@
     "--query-driver=**",
     "--compile-commands-dir=/home/lm/esp_project/project-name/build"
   ],
-  "idf.flashType": "JTAG"
+  "idf.flashType": "UART"
 }

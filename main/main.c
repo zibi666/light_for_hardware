@@ -19,6 +19,40 @@
 #include <string.h>
 #include "uart.h"
 #include "protocol.h"
+#include "http_request.h"
+
+static int g_heart_rate = 0;
+static int g_breathing_rate = 0;
+
+static void upload_data_task(void *pvParameters)
+{
+    while (1)
+    {
+        if (!wifi_wait_connected(5000))
+        {
+            printf("Wi-Fi未连接，跳过上传\n");
+            vTaskDelay(pdMS_TO_TICKS(30000));
+            continue;
+        }
+
+        health_data_t data = {
+            .heart_rate = g_heart_rate,
+            .breathing_rate = g_breathing_rate
+        };
+
+        if (g_heart_rate > 0 || g_breathing_rate > 0)
+        {
+            printf("正在上传数据 - 心率:%d 呼吸:%d\n", data.heart_rate, data.breathing_rate);
+            http_send_health_data(&data);
+        }
+        else
+        {
+            printf("暂无有效数据，跳过上传\n");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(30000));
+    }
+}
 
 
 
@@ -40,6 +74,9 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
+
+    wifi_init_sta();
+    xTaskCreate(upload_data_task, "upload_data_task", 4096, NULL, 5, NULL);
 
     uart0_init(115200);             /* 初始化串口0 */
 
@@ -74,6 +111,7 @@ void app_main(void)
                     if (ctrl == CTRL_HEART_RATE && cmd == CMD_HEART_RATE_REPORT) {
                         if (data_len == 1) {
                             uint8_t heart_rate = data_ptr[0];
+                            g_heart_rate = heart_rate;
                             printf("心率: %d bpm\n", heart_rate);
                         }
                     } else if (ctrl == CTRL_HEART_RATE && cmd == CMD_HEART_RATE_SWITCH) {
@@ -138,6 +176,7 @@ void app_main(void)
                     } else if (ctrl == CTRL_BREATH && cmd == CMD_BREATH_VALUE) {
                         if (data_len == 1) {
                             uint8_t breath = data_ptr[0];
+                            g_breathing_rate = breath;
                             printf("呼吸频率: %d 次/分\n", breath);
                         }
                     } else if (ctrl == 0x01 && cmd == 0x01) {
