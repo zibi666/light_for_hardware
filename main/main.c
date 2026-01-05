@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include <inttypes.h>
+#include <stddef.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -20,9 +21,28 @@
 #include "uart.h"
 #include "protocol.h"
 #include "http_request.h"
+#include "sleep_analysis.h"
 
 static int g_heart_rate = 0;
 static int g_breathing_rate = 0;
+static float g_motion_index = 0.0f;
+
+#define MAX_SLEEP_EPOCHS 512
+static sleep_epoch_t g_epochs[MAX_SLEEP_EPOCHS];
+static sleep_stage_result_t g_stage_results[MAX_SLEEP_EPOCHS];
+static size_t g_epoch_count = 0;
+static sleep_thresholds_t g_thresholds = {0};
+
+static const char *stage_to_str(sleep_stage_t s)
+{
+    switch (s)
+    {
+    case SLEEP_STAGE_WAKE: return "清醒";
+    case SLEEP_STAGE_REM:  return "REM";
+    case SLEEP_STAGE_NREM: return "非REM";
+    default: return "未知";
+    }
+}
 
 static void upload_data_task(void *pvParameters)
 {
@@ -54,6 +74,49 @@ static void upload_data_task(void *pvParameters)
     }
 }
 
+static void sleep_stage_task(void *pvParameters)
+{
+    const TickType_t period = pdMS_TO_TICKS(10000); // 60s 一个epoch
+    sleep_quality_report_t report;
+
+    while (1)
+    {
+        sleep_epoch_t epoch = {
+            .respiratory_rate_bpm = (g_breathing_rate > 0) ? (float)g_breathing_rate : 0.0f,
+            .motion_index = g_motion_index,
+            .duration_seconds = 10
+        };
+
+        if (g_epoch_count >= MAX_SLEEP_EPOCHS)
+        {
+            memmove(&g_epochs[0], &g_epochs[1], (MAX_SLEEP_EPOCHS - 1) * sizeof(sleep_epoch_t));
+            memmove(&g_stage_results[0], &g_stage_results[1], (MAX_SLEEP_EPOCHS - 1) * sizeof(sleep_stage_result_t));
+            g_epoch_count = MAX_SLEEP_EPOCHS - 1;
+        }
+
+        g_epochs[g_epoch_count] = epoch;
+        g_epoch_count++;
+
+        sleep_analysis_compute_thresholds(g_epochs, g_epoch_count, &g_thresholds);
+        sleep_analysis_detect_stages(g_epochs, g_epoch_count, &g_thresholds, g_stage_results);
+        sleep_analysis_build_quality(g_epochs, g_stage_results, g_epoch_count, &report);
+
+        if (g_epoch_count > 0)
+        {
+            const sleep_stage_result_t *last = &g_stage_results[g_epoch_count - 1];
+            printf("[睡眠] 阶段:%s 呼吸:%.1f 体动:%.2f 评分:%.1f 效率:%.2f REM占比:%.2f\n",
+                   stage_to_str(last->stage),
+                   last->respiratory_rate_bpm,
+                   last->motion_index,
+                   report.sleep_score,
+                   report.sleep_efficiency,
+                   report.rem_ratio);
+        }
+
+        vTaskDelay(period);
+    }
+}
+
 
 
 /**
@@ -77,6 +140,7 @@ void app_main(void)
 
     wifi_init_sta();
     xTaskCreate(upload_data_task, "upload_data_task", 4096, NULL, 5, NULL);
+    xTaskCreate(sleep_stage_task, "sleep_stage_task", 4096, NULL, 5, NULL);
 
     uart0_init(115200);             /* 初始化串口0 */
 
@@ -164,9 +228,16 @@ void app_main(void)
                             case CMD_MOTION_INFO: // 运动信息
                                 if (data_len == 1) {
                                     uint8_t motion = data_ptr[0];
-                                    if (motion == 0x01) printf("运动信息: 静止\n");
-                                    else if (motion == 0x02) printf("运动信息: 活跃\n");
-                                    else printf("运动信息: 未知 (%02X)\n", motion);
+                                    if (motion == 0x01) {
+                                        g_motion_index = 0.1f; // 静止
+                                        printf("运动信息: 静止\n");
+                                    } else if (motion == 0x02) {
+                                        g_motion_index = 2.0f; // 活跃
+                                        printf("运动信息: 活跃\n");
+                                    } else {
+                                        g_motion_index = 0.5f;
+                                        printf("运动信息: 未知 (%02X)\n", motion);
+                                    }
                                 }
                                 break;
                             default:

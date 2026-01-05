@@ -1,12 +1,14 @@
 set(src_dirs
             UART
             Protocol
-            HTTP)
+            HTTP
+            SleepAnalysis)
 
 set(include_dirs
             UART
             Protocol
-            HTTP)
+            HTTP
+            SleepAnalysis)
 
 set(requires
             driver
