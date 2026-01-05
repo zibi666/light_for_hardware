@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -28,6 +29,23 @@ static int g_breathing_rate = 0;
 static float g_motion_index = 0.0f;
 static float g_motion_accum = 0.0f;
 static uint32_t g_motion_samples = 0;
+
+typedef enum {
+    SLEEP_WARMUP = 0,
+    SLEEP_SETTLING,
+    SLEEP_ACTIVE
+} sleep_state_t;
+
+static sleep_state_t g_sleep_state = SLEEP_WARMUP;
+static TickType_t g_start_tick = 0;
+static size_t g_sleep_start_index = SIZE_MAX; // 首个被纳入阈值计算的索引
+
+#define WARMUP_MS            60000U      // 60 秒暖机
+#define EPOCH_MS             30000U      // 30 秒窗口
+#define ONSET_WINDOW_EPOCHS  2U          // 1 分钟 (2*30s)
+#define MOTION_ONSET_MAX     5.0f        // 入睡判定体动均值阈值
+#define RESP_ONSET_MIN       10.0f       // 入睡判定呼吸下限
+#define RESP_ONSET_MAX       25.0f       // 入睡判定呼吸上限
 
 #define MAX_SLEEP_EPOCHS 512
 static sleep_epoch_t g_epochs[MAX_SLEEP_EPOCHS];
@@ -78,11 +96,27 @@ static void upload_data_task(void *pvParameters)
 
 static void sleep_stage_task(void *pvParameters)
 {
-    const TickType_t period = pdMS_TO_TICKS(30000); // 30s 一个epoch
+    const TickType_t period = pdMS_TO_TICKS(EPOCH_MS);
     sleep_quality_report_t report;
+    g_start_tick = xTaskGetTickCount();
 
     while (1)
     {
+        // 暖机阶段：直接丢弃数据，清空累积，等待 60s
+        if (g_sleep_state == SLEEP_WARMUP) {
+            TickType_t elapsed = xTaskGetTickCount() - g_start_tick;
+            if (elapsed < pdMS_TO_TICKS(WARMUP_MS)) {
+                g_motion_accum = 0.0f;
+                g_motion_samples = 0;
+                g_breathing_rate = 0;
+                g_heart_rate = 0;
+                vTaskDelay(period);
+                continue;
+            }
+            g_sleep_state = SLEEP_SETTLING;
+            g_sleep_start_index = SIZE_MAX;
+        }
+
         float motion_avg = (g_motion_samples > 0) ? (g_motion_accum / (float)g_motion_samples) : g_motion_index;
         sleep_epoch_t epoch = {
             .respiratory_rate_bpm = (g_breathing_rate > 0) ? (float)g_breathing_rate : 0.0f,
@@ -97,14 +131,56 @@ static void sleep_stage_task(void *pvParameters)
         {
             memmove(&g_epochs[0], &g_epochs[1], (MAX_SLEEP_EPOCHS - 1) * sizeof(sleep_epoch_t));
             memmove(&g_stage_results[0], &g_stage_results[1], (MAX_SLEEP_EPOCHS - 1) * sizeof(sleep_stage_result_t));
+            if (g_sleep_start_index != SIZE_MAX) {
+                if (g_sleep_start_index > 0) g_sleep_start_index -= 1;
+                else g_sleep_start_index = 0;
+            }
             g_epoch_count = MAX_SLEEP_EPOCHS - 1;
         }
 
         g_epochs[g_epoch_count] = epoch;
         g_epoch_count++;
 
-        sleep_analysis_compute_thresholds(g_epochs, g_epoch_count, &g_thresholds);
-        sleep_analysis_detect_stages(g_epochs, g_epoch_count, &g_thresholds, g_stage_results);
+        // 入睡判定：仅在 SETTLING 状态下检查最近 5 分钟
+        if (g_sleep_state == SLEEP_SETTLING && g_epoch_count >= ONSET_WINDOW_EPOCHS) {
+            float m_sum = 0.0f, r_sum = 0.0f;
+            size_t start = g_epoch_count - ONSET_WINDOW_EPOCHS;
+            for (size_t i = start; i < g_epoch_count; ++i) {
+                m_sum += g_epochs[i].motion_index;
+                r_sum += g_epochs[i].respiratory_rate_bpm;
+            }
+            float m_mean = m_sum / (float)ONSET_WINDOW_EPOCHS;
+            float r_mean = r_sum / (float)ONSET_WINDOW_EPOCHS;
+            if (m_mean < MOTION_ONSET_MAX && r_mean >= RESP_ONSET_MIN && r_mean <= RESP_ONSET_MAX) {
+                g_sleep_state = SLEEP_ACTIVE;
+                g_sleep_start_index = g_epoch_count; // 从下一个 epoch 开始计入阈值
+                printf("[睡眠] 检测到入睡，m=%.2f r=%.2f\n", m_mean, r_mean);
+            }
+        }
+
+        // 预睡期的 epoch 强制标记为清醒，且不进入阈值计算
+        for (size_t i = 0; i < g_epoch_count; ++i) {
+            if (g_sleep_start_index == SIZE_MAX || i < g_sleep_start_index) {
+                g_stage_results[i].stage = SLEEP_STAGE_WAKE;
+                g_stage_results[i].respiratory_rate_bpm = g_epochs[i].respiratory_rate_bpm;
+                g_stage_results[i].motion_index = g_epochs[i].motion_index;
+            }
+        }
+
+        const sleep_epoch_t *sleep_ptr = NULL;
+        size_t sleep_count = 0;
+        if (g_sleep_start_index != SIZE_MAX && g_sleep_start_index < g_epoch_count) {
+            sleep_ptr = &g_epochs[g_sleep_start_index];
+            sleep_count = g_epoch_count - g_sleep_start_index;
+        }
+
+        if (sleep_count > 0) {
+            sleep_analysis_compute_thresholds(sleep_ptr, sleep_count, &g_thresholds);
+            sleep_analysis_detect_stages(sleep_ptr, sleep_count, &g_thresholds, &g_stage_results[g_sleep_start_index]);
+        } else {
+            memset(&g_thresholds, 0, sizeof(g_thresholds));
+        }
+
         sleep_analysis_build_quality(g_epochs, g_stage_results, g_epoch_count, &report);
 
         if (g_epoch_count >= 5) {
@@ -118,13 +194,19 @@ static void sleep_stage_task(void *pvParameters)
         if (g_epoch_count > 0)
         {
             const sleep_stage_result_t *last = &g_stage_results[g_epoch_count - 1];
-            printf("[睡眠] 阶段:%s 呼吸:%.1f 体动:%.2f 评分:%.1f 效率:%.2f REM占比:%.2f\n",
-                   stage_to_str(last->stage),
-                   last->respiratory_rate_bpm,
-                   last->motion_index,
-                   report.sleep_score,
-                   report.sleep_efficiency,
-                   report.rem_ratio);
+            if (g_sleep_state != SLEEP_ACTIVE || sleep_count == 0) {
+                printf("[睡眠] 未入睡/暖机或未满足条件，强制清醒。呼吸:%.1f 体动:%.2f\n",
+                       last->respiratory_rate_bpm,
+                       last->motion_index);
+            } else {
+                printf("[睡眠] 阶段:%s 呼吸:%.1f 体动:%.2f 评分:%.1f 效率:%.2f REM占比:%.2f\n",
+                       stage_to_str(last->stage),
+                       last->respiratory_rate_bpm,
+                       last->motion_index,
+                       report.sleep_score,
+                       report.sleep_efficiency,
+                       report.rem_ratio);
+            }
         }
 
         vTaskDelay(period);
