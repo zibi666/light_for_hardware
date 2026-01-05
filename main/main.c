@@ -26,6 +26,8 @@
 static int g_heart_rate = 0;
 static int g_breathing_rate = 0;
 static float g_motion_index = 0.0f;
+static float g_motion_accum = 0.0f;
+static uint32_t g_motion_samples = 0;
 
 #define MAX_SLEEP_EPOCHS 512
 static sleep_epoch_t g_epochs[MAX_SLEEP_EPOCHS];
@@ -76,16 +78,20 @@ static void upload_data_task(void *pvParameters)
 
 static void sleep_stage_task(void *pvParameters)
 {
-    const TickType_t period = pdMS_TO_TICKS(10000); // 60s 一个epoch
+    const TickType_t period = pdMS_TO_TICKS(30000); // 30s 一个epoch
     sleep_quality_report_t report;
 
     while (1)
     {
+        float motion_avg = (g_motion_samples > 0) ? (g_motion_accum / (float)g_motion_samples) : g_motion_index;
         sleep_epoch_t epoch = {
             .respiratory_rate_bpm = (g_breathing_rate > 0) ? (float)g_breathing_rate : 0.0f,
-            .motion_index = g_motion_index,
-            .duration_seconds = 10
+            .motion_index = motion_avg,
+            .duration_seconds = 30
         };
+
+        g_motion_accum = 0.0f;
+        g_motion_samples = 0;
 
         if (g_epoch_count >= MAX_SLEEP_EPOCHS)
         {
@@ -100,6 +106,14 @@ static void sleep_stage_task(void *pvParameters)
         sleep_analysis_compute_thresholds(g_epochs, g_epoch_count, &g_thresholds);
         sleep_analysis_detect_stages(g_epochs, g_epoch_count, &g_thresholds, g_stage_results);
         sleep_analysis_build_quality(g_epochs, g_stage_results, g_epoch_count, &report);
+
+        if (g_epoch_count >= 5) {
+            if (g_thresholds.motion_threshold < 1.0f || g_thresholds.resp_rate_threshold < 5.0f) {
+                printf("[睡眠][告警] 阈值异常: RR_thres=%.2f Mov_thres=%.2f (可能输入数据为 0)\n",
+                       g_thresholds.resp_rate_threshold,
+                       g_thresholds.motion_threshold);
+            }
+        }
 
         if (g_epoch_count > 0)
         {
@@ -183,12 +197,13 @@ void app_main(void)
                     } else if (ctrl == CTRL_HUMAN_PRESENCE) {
                         switch (cmd) {
                             case CMD_BODY_MOVEMENT: // 体动参数
-                                /* 屏蔽体动参数输出
                                 if (data_len == 1) {
                                     uint8_t movement = data_ptr[0];
+                                    g_motion_index = (float)movement; // 0~100 连续值
+                                    g_motion_accum += g_motion_index;
+                                    g_motion_samples++;
                                     printf("体动参数: %d\n", movement);
                                 }
-                                */
                                 break;
                             case CMD_HUMAN_DISTANCE: // 人体距离
                                 /* 屏蔽人体距离输出
@@ -228,16 +243,10 @@ void app_main(void)
                             case CMD_MOTION_INFO: // 运动信息
                                 if (data_len == 1) {
                                     uint8_t motion = data_ptr[0];
-                                    if (motion == 0x01) {
-                                        g_motion_index = 0.1f; // 静止
-                                        printf("运动信息: 静止\n");
-                                    } else if (motion == 0x02) {
-                                        g_motion_index = 2.0f; // 活跃
-                                        printf("运动信息: 活跃\n");
-                                    } else {
-                                        g_motion_index = 0.5f;
-                                        printf("运动信息: 未知 (%02X)\n", motion);
-                                    }
+                                    // 仍保留状态输出，但以连续体动参数为主
+                                    if (motion == 0x01) printf("运动信息: 静止\n");
+                                    else if (motion == 0x02) printf("运动信息: 活跃\n");
+                                    else printf("运动信息: 未知 (%02X)\n", motion);
                                 }
                                 break;
                             default:
