@@ -4,7 +4,8 @@ set(src_dirs
             HTTP
             SleepAnalysis
             Audio
-            Input)
+            Input
+            App)
 
 set(include_dirs
             UART
@@ -12,7 +13,8 @@ set(include_dirs
             HTTP
             SleepAnalysis
             Audio
-            Input)
+            Input
+            App)
 
 set(requires
             driver
