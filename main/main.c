@@ -23,6 +23,7 @@
 #include "protocol.h"
 #include "http_request.h"
 #include "sleep_analysis.h"
+#include "audio_player.h"
 
 static int g_heart_rate = 0;
 static int g_breathing_rate = 0;
@@ -237,6 +238,11 @@ void app_main(void)
     wifi_init_sta();
     xTaskCreate(upload_data_task, "upload_data_task", 4096, NULL, 5, NULL);
     xTaskCreate(sleep_stage_task, "sleep_stage_task", 4096, NULL, 5, NULL);
+
+    if (audio_player_start() != ESP_OK)
+    {
+        printf("音频播放任务启动失败\n");
+    }
 
     uart0_init(115200);             /* 初始化串口0 */
 
