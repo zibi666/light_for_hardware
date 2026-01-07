@@ -30,7 +30,7 @@
 #define ALARM_DEFAULT_HOST   "192.168.1.108"
 #define ALARM_DEFAULT_PORT   6060
 #define ALARM_FETCH_PERIOD_MS 60000
-#define ALARM_TASK_STACK      4096
+#define ALARM_TASK_STACK      6144
 #define ALARM_TASK_PRIO       4
 
 static EventGroupHandle_t s_wifi_event_group;
@@ -672,19 +672,25 @@ esp_err_t http_fetch_alarms(alarm_list_t *out_list)
 
 static void alarm_fetch_task_fn(void *arg)
 {
-    alarm_list_t latest;
+    alarm_list_t *latest = (alarm_list_t *)calloc(1, sizeof(alarm_list_t));
+    if (!latest) {
+        ESP_LOGE(TAG, "alarm fetch alloc failed");
+        vTaskDelete(NULL);
+        return;
+    }
     while (1) {
-        if (http_fetch_alarms(&latest) == ESP_OK) {
+        if (http_fetch_alarms(latest) == ESP_OK) {
             if (!s_alarm_mutex) {
                 s_alarm_mutex = xSemaphoreCreateMutex();
             }
             if (s_alarm_mutex && xSemaphoreTake(s_alarm_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-                s_alarm_list = latest;
+                s_alarm_list = *latest;
                 xSemaphoreGive(s_alarm_mutex);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(s_alarm_fetch_period_ms));
     }
+    free(latest);
 }
 
 static void alarm_monitor_task_fn(void *arg)
