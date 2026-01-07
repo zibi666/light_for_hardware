@@ -39,6 +39,7 @@ static TaskHandle_t s_volume_task = NULL;
 static QueueHandle_t s_cmd_queue = NULL;
 static bool s_inited = false;
 static bool s_stop = false;
+static volatile bool s_paused = false;
 static size_t s_track_index = 0;
 
 typedef enum
@@ -192,6 +193,7 @@ static esp_err_t play_single(const char *path, size_t track_count, bool *interru
 
     ESP_LOGI(TAG, "play %s (%lu Hz, %u bit, %u ch)", path, (unsigned long)info.sample_rate, info.bits_per_sample, info.channels);
 
+    bool was_paused = false;
     while (!s_stop)
     {
         audio_cmd_t cmd;
@@ -217,6 +219,27 @@ static esp_err_t play_single(const char *path, size_t track_count, bool *interru
         if (fr != FR_OK || br == 0)
         {
             break;
+        }
+
+        if (s_paused)
+        {
+            if (!was_paused)
+            {
+                audio_hw_stop();
+                was_paused = true;
+                ESP_LOGI(TAG, "playback paused");
+            }
+            while (s_paused && !s_stop)
+            {
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            if (s_stop)
+            {
+                break;
+            }
+            ESP_ERROR_CHECK(audio_hw_start());
+            was_paused = false;
+            ESP_LOGI(TAG, "playback resumed");
         }
 
         size_t written = audio_hw_write(buf, br, pdMS_TO_TICKS(500));
@@ -350,12 +373,17 @@ static void volume_task(void *args)
             ESP_ERROR_CHECK(audio_hw_set_volume(vol));
             ESP_LOGI(TAG, "volume set to %u", vol);
         }
-        else if ((key == XL9555_KEY0 || key == XL9555_KEY2) && s_cmd_queue)
+        else if (key == XL9555_KEY2)
         {
-            audio_cmd_t cmd = (key == XL9555_KEY0) ? AUDIO_CMD_PREV : AUDIO_CMD_NEXT;
+            s_paused = !s_paused;
+            ESP_LOGI(TAG, "playback %s", s_paused ? "paused" : "resumed");
+        }
+        else if (key == XL9555_KEY0 && s_cmd_queue)
+        {
+            audio_cmd_t cmd = AUDIO_CMD_PREV;
             if (xQueueSend(s_cmd_queue, &cmd, 0) == pdTRUE)
             {
-                ESP_LOGI(TAG, "track cmd: %s", (cmd == AUDIO_CMD_PREV) ? "prev" : "next");
+                ESP_LOGI(TAG, "track cmd: prev");
             }
         }
 

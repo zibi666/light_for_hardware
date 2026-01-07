@@ -5,7 +5,8 @@ set(src_dirs
             SleepAnalysis
             Audio
             Input
-            App)
+            App
+            RTC)
 
 set(include_dirs
             UART
@@ -14,7 +15,8 @@ set(include_dirs
             SleepAnalysis
             Audio
             Input
-            App)
+            App
+            RTC)
 
 set(requires
             driver
@@ -24,7 +26,8 @@ set(requires
             esp_http_client
             json
             fatfs
-            sdmmc)
+            sdmmc
+            lwip)
 
 idf_component_register(SRC_DIRS ${src_dirs} INCLUDE_DIRS ${include_dirs} REQUIRES ${requires})
 
