@@ -47,6 +47,7 @@ esp_err_t http_send_health_data(const health_data_t *data);
 esp_err_t http_set_alarm_server(const char *host, uint16_t port);
 esp_err_t http_set_alarm_user(const char *user_id);
 esp_err_t http_fetch_alarms(alarm_list_t *out_list);
+esp_err_t http_update_alarm_status(int alarm_id, int status);
 time_t alarm_compute_next_trigger(const alarm_info_t *alarm, const struct tm *now_local);
 bool alarm_is_due(const alarm_info_t *alarm, const struct tm *now_local);
 esp_err_t alarm_service_start(uint32_t fetch_interval_ms, alarm_trigger_cb_t cb, void *cb_ctx);

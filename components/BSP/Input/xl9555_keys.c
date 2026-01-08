@@ -4,6 +4,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "audio_hw.h"
+#include <stdbool.h>
 
 static const char *TAG = "xl9555_keys";
 
@@ -25,6 +26,8 @@ static const char *TAG = "xl9555_keys";
 
 /* Port0 bit 2 drives SPK_EN (active low to enable speaker) on this board */
 #define SPK_EN_BIT 2
+/* Port0 bit 3 drives BEEP (active low to enable buzzer) */
+#define BEEP_BIT   3
 
 static i2c_master_dev_handle_t s_dev = NULL;
 
@@ -32,6 +35,28 @@ static esp_err_t xl9555_write_reg(uint8_t reg, uint8_t val)
 {
     uint8_t buf[2] = {reg, val};
     return i2c_master_transmit(s_dev, buf, sizeof(buf), 1000);
+}
+
+static esp_err_t xl9555_read_regs(uint8_t reg, uint8_t *data, size_t len);
+
+static esp_err_t xl9555_update_output_bit(uint8_t bit, bool level)
+{
+    uint8_t out[2];
+    if (xl9555_read_regs(REG_OUTPUT0, out, sizeof(out)) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    if (bit < 8) {
+        if (level) out[0] |= (uint8_t)(1u << bit); else out[0] &= (uint8_t)~(1u << bit);
+    } else {
+        uint8_t b = bit - 8;
+        if (level) out[1] |= (uint8_t)(1u << b); else out[1] &= (uint8_t)~(1u << b);
+    }
+
+    if (xl9555_write_reg(REG_OUTPUT0, out[0]) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    return xl9555_write_reg(REG_OUTPUT1, out[1]);
 }
 
 static esp_err_t xl9555_read_regs(uint8_t reg, uint8_t *data, size_t len)
@@ -55,15 +80,31 @@ esp_err_t xl9555_keys_init(void)
     }
 
     /* Configure: port0 bit2 as output for speaker enable, others inputs; port1 all inputs */
-    uint8_t cfg0 = 0xFF & ~(1u << SPK_EN_BIT); /* 0=output */
+    uint8_t cfg0 = 0xFF & ~( (1u << SPK_EN_BIT) | (1u << BEEP_BIT) ); /* 0=output */
     ESP_RETURN_ON_ERROR(xl9555_write_reg(REG_CONFIG0, cfg0), TAG, "cfg0");
     ESP_RETURN_ON_ERROR(xl9555_write_reg(REG_CONFIG1, 0xFF), TAG, "cfg1");
 
-    /* Drive speaker enable low to turn on amplifier */
-    uint8_t out0 = (uint8_t)~(1u << SPK_EN_BIT);
+    /* Drive speaker enable low to turn on amplifier, keep beep high (off) */
+    uint8_t out0 = 0xFF & ~(1u << SPK_EN_BIT); /* SPK_EN=0 (on), BEEP=1 (off) */
     ESP_RETURN_ON_ERROR(xl9555_write_reg(REG_OUTPUT0, out0), TAG, "spk on");
     ESP_RETURN_ON_ERROR(xl9555_write_reg(REG_OUTPUT1, 0xFF), TAG, "out1");
     return ESP_OK;
+}
+
+esp_err_t xl9555_beep_init(void)
+{
+    /* already configured in keys_init */
+    return (s_dev != NULL) ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+esp_err_t xl9555_beep_on(void)
+{
+    return xl9555_update_output_bit(BEEP_BIT, false); /* active low */
+}
+
+esp_err_t xl9555_beep_off(void)
+{
+    return xl9555_update_output_bit(BEEP_BIT, true);
 }
 
 uint8_t xl9555_keys_scan(uint8_t mode)

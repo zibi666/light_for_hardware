@@ -354,40 +354,10 @@ static void audio_task(void *args)
 
 static void volume_task(void *args)
 {
-    const uint8_t step = 2;
+    /* 所有按键功能已移除，仅保留任务框架 */
     while (!s_stop)
     {
-        uint8_t key = xl9555_keys_scan(0);
-        if (key == XL9555_KEY1 || key == XL9555_KEY3)
-        {
-            uint8_t vol = audio_hw_get_volume();
-            if (key == XL9555_KEY1 && vol > 0)
-            {
-                vol = (vol > step) ? (uint8_t)(vol - step) : 0;
-            }
-            else if (key == XL9555_KEY3 && vol < 33)
-            {
-                vol = (vol + step > 33) ? 33 : (uint8_t)(vol + step);
-            }
-
-            ESP_ERROR_CHECK(audio_hw_set_volume(vol));
-            ESP_LOGI(TAG, "volume set to %u", vol);
-        }
-        else if (key == XL9555_KEY2)
-        {
-            s_paused = !s_paused;
-            ESP_LOGI(TAG, "playback %s", s_paused ? "paused" : "resumed");
-        }
-        else if (key == XL9555_KEY0 && s_cmd_queue)
-        {
-            audio_cmd_t cmd = AUDIO_CMD_PREV;
-            if (xQueueSend(s_cmd_queue, &cmd, 0) == pdTRUE)
-            {
-                ESP_LOGI(TAG, "track cmd: prev");
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(120));
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 
     s_volume_task = NULL;

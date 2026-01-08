@@ -23,12 +23,13 @@
 #define WIFI_SSID      "TP-LINK"
 #define WIFI_PASS      "708708708"
 #define MAXIMUM_RETRY  5
+#define WIFI_RECONNECT_PERIOD_MS 10000
 
 // 服务器配置
-#define SERVER_URL     "http://192.168.1.108:6060/api/health/upload"
+#define SERVER_URL     "http://192.168.1.108:8080/api/health/upload"
 
 #define ALARM_DEFAULT_HOST   "192.168.1.108"
-#define ALARM_DEFAULT_PORT   6060
+#define ALARM_DEFAULT_PORT   8080
 #define ALARM_FETCH_PERIOD_MS 60000
 #define ALARM_TASK_STACK      6144
 #define ALARM_TASK_PRIO       4
@@ -37,6 +38,9 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 static int s_retry_num = 0;
+static TaskHandle_t s_wifi_reconnect_task = NULL;
+
+static void wifi_reconnect_task(void *arg);
 
 static char s_alarm_host[64] = ALARM_DEFAULT_HOST;
 static uint16_t s_alarm_port = ALARM_DEFAULT_PORT;
@@ -48,6 +52,40 @@ static TaskHandle_t s_alarm_fetch_task = NULL;
 static TaskHandle_t s_alarm_monitor_task = NULL;
 static alarm_trigger_cb_t s_alarm_cb = NULL;
 static void *s_alarm_cb_ctx = NULL;
+
+static void log_alarm_snapshot(const alarm_list_t *list)
+{
+    time_t now_ts = time(NULL);
+    struct tm now_tm = {0};
+    localtime_r(&now_ts, &now_tm);
+
+    ESP_LOGI(TAG, "RTC now %04d-%02d-%02d %02d:%02d:%02d, alarms: %u",
+             now_tm.tm_year + 1900, now_tm.tm_mon + 1, now_tm.tm_mday,
+             now_tm.tm_hour, now_tm.tm_min, now_tm.tm_sec,
+             list ? (unsigned)list->count : 0);
+
+    if (!list) {
+        return;
+    }
+
+    for (size_t i = 0; i < list->count; ++i) {
+        const alarm_info_t *a = &list->items[i];
+        struct tm nt = {0};
+        if (a->next_trigger > 0) {
+            localtime_r(&a->next_trigger, &nt);
+        }
+        ESP_LOGI(TAG, "id=%d type=%d status=%d time=%s date=%s repeat=%s next=%04d-%02d-%02d %02d:%02d:%02d",
+                 a->id, a->type, a->status,
+                 a->alarm_time, a->target_date,
+                 a->repeat_days,
+                 (a->next_trigger > 0) ? (nt.tm_year + 1900) : 0,
+                 (a->next_trigger > 0) ? (nt.tm_mon + 1) : 0,
+                 (a->next_trigger > 0) ? nt.tm_mday : 0,
+                 (a->next_trigger > 0) ? nt.tm_hour : 0,
+                 (a->next_trigger > 0) ? nt.tm_min : 0,
+                 (a->next_trigger > 0) ? nt.tm_sec : 0);
+    }
+}
 
 typedef struct {
     char *data;
@@ -78,14 +116,12 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < MAXIMUM_RETRY) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "retry to connect to the AP");
-        } else {
+        esp_wifi_connect();
+        s_retry_num++;
+        if (s_retry_num >= MAXIMUM_RETRY) {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
-        ESP_LOGI(TAG, "connect to the AP fail");
+        ESP_LOGI(TAG, "connect to the AP fail (%d)", s_retry_num);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
@@ -146,6 +182,10 @@ void wifi_init_sta(void)
     } else {
         ESP_LOGE(TAG, "UNEXPECTED EVENT");
     }
+
+    if (!s_wifi_reconnect_task) {
+        xTaskCreate(wifi_reconnect_task, "wifi_reconnect", 3072, NULL, 4, &s_wifi_reconnect_task);
+    }
 }
 
 static bool ensure_resp_capacity(http_resp_buffer_t *buf, size_t incoming)
@@ -175,6 +215,18 @@ static bool ensure_resp_capacity(http_resp_buffer_t *buf, size_t incoming)
     buf->data = new_data;
     buf->cap = new_cap;
     return true;
+}
+
+static void wifi_reconnect_task(void *arg)
+{
+    while (1) {
+        if (!wifi_is_connected()) {
+            ESP_LOGW(TAG, "Wi-Fi down, reconnecting...");
+            esp_wifi_disconnect();
+            esp_wifi_connect();
+        }
+        vTaskDelay(pdMS_TO_TICKS(WIFI_RECONNECT_PERIOD_MS));
+    }
 }
 
 static esp_err_t collect_http_event(esp_http_client_event_t *evt)
@@ -493,7 +545,17 @@ time_t alarm_compute_next_trigger(const alarm_info_t *alarm, const struct tm *no
             return 0;
         }
         time_t target_ts = mktime(&target_tm);
-        if (target_ts == (time_t)-1 || target_ts <= now_ts) {
+        if (target_ts == (time_t)-1) {
+            return 0;
+        }
+        /* Allow triggering within the same minute (check hour:min only) */
+        struct tm target_check = target_tm;
+        struct tm now_check = *now_local;
+        target_check.tm_sec = 0;  /* Ignore seconds for comparison */
+        now_check.tm_sec = 0;
+        time_t target_min_ts = mktime(&target_check);
+        time_t now_min_ts = mktime(&now_check);
+        if (target_min_ts == (time_t)-1 || now_min_ts == (time_t)-1 || target_min_ts < now_min_ts) {
             return 0;
         }
         return target_ts;
@@ -528,13 +590,12 @@ bool alarm_is_due(const alarm_info_t *alarm, const struct tm *now_local)
     if (!alarm || !now_local || alarm->next_trigger == 0) {
         return false;
     }
-    struct tm now_copy = *now_local;
-    time_t now_ts = mktime(&now_copy);
-    if (now_ts == (time_t)-1) {
-        return false;
-    }
-    double diff = difftime(alarm->next_trigger, now_ts);
-    return diff <= 1.0 && diff >= -1.0;
+    struct tm trigger_tm;
+    localtime_r(&alarm->next_trigger, &trigger_tm);
+    
+    /* Match by hour and minute only, not second */
+    return (now_local->tm_hour == trigger_tm.tm_hour && 
+            now_local->tm_min == trigger_tm.tm_min);
 }
 
 static esp_err_t http_fetch_raw(const char *url, http_resp_buffer_t *resp)
@@ -563,6 +624,38 @@ static esp_err_t http_fetch_raw(const char *url, http_resp_buffer_t *resp)
         int status = esp_http_client_get_status_code(client);
         if (status != 200) {
             ESP_LOGE(TAG, "HTTP GET status %d", status);
+            err = ESP_FAIL;
+        }
+    }
+
+    esp_http_client_cleanup(client);
+    return err;
+}
+
+static esp_err_t http_put_no_body(const char *url)
+{
+    if (!url) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_PUT,
+        .timeout_ms = 5000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP PUT failed: %s", esp_err_to_name(err));
+    } else {
+        int status = esp_http_client_get_status_code(client);
+        if (status != 200) {
+            ESP_LOGE(TAG, "HTTP PUT status %d", status);
             err = ESP_FAIL;
         }
     }
@@ -670,6 +763,24 @@ esp_err_t http_fetch_alarms(alarm_list_t *out_list)
     return ESP_OK;
 }
 
+esp_err_t http_update_alarm_status(int alarm_id, int status)
+{
+    if (alarm_id <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!wifi_wait_connected(5000)) {
+        ESP_LOGW(TAG, "Wi-Fi not connected, skip alarm status update");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char url[160];
+    snprintf(url, sizeof(url), "http://%s:%u/api/alarms/%d/status?userId=%s&status=%d",
+             s_alarm_host, (unsigned)s_alarm_port, alarm_id, s_alarm_user, status);
+
+    return http_put_no_body(url);
+}
+
 static void alarm_fetch_task_fn(void *arg)
 {
     alarm_list_t *latest = (alarm_list_t *)calloc(1, sizeof(alarm_list_t));
@@ -685,6 +796,7 @@ static void alarm_fetch_task_fn(void *arg)
             }
             if (s_alarm_mutex && xSemaphoreTake(s_alarm_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
                 s_alarm_list = *latest;
+                log_alarm_snapshot(&s_alarm_list);
                 xSemaphoreGive(s_alarm_mutex);
             }
         }
@@ -727,9 +839,14 @@ static void alarm_monitor_task_fn(void *arg)
 
                     if (alarm->type == ALARM_TYPE_ONCE) {
                         alarm->next_trigger = 0;
-                        alarm->status = 0;
+                        if (http_update_alarm_status(alarm->id, 0) == ESP_OK) {
+                            alarm->status = 0;
+                        } else {
+                            ESP_LOGW(TAG, "Failed to update alarm %d status to 0", alarm->id);
+                        }
                     } else {
-                        time_t next_base_ts = now_ts + 1;
+                        /* Skip to next minute to avoid repeated triggers within same minute */
+                        time_t next_base_ts = now_ts + 60;
                         struct tm next_base;
                         localtime_r(&next_base_ts, &next_base);
                         alarm->next_trigger = alarm_compute_next_trigger(alarm, &next_base);

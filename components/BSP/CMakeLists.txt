@@ -6,7 +6,8 @@ set(src_dirs
             Audio
             Input
             App
-            RTC)
+            RTC
+            AlarmMusic)
 
 set(include_dirs
             UART
@@ -16,7 +17,8 @@ set(include_dirs
             Audio
             Input
             App
-            RTC)
+            RTC
+            AlarmMusic)
 
 set(requires
             driver

@@ -18,6 +18,12 @@ enum xl9555_key_code
     XL9555_KEY3 = 4,
 };
 
+#define XL9555_BEEP_BIT   3
+
+esp_err_t xl9555_beep_on(void);
+esp_err_t xl9555_beep_off(void);
+esp_err_t xl9555_beep_init(void);
+
 esp_err_t xl9555_keys_init(void);
 /* mode: 0 no-repeat, 1 repeat */
 uint8_t xl9555_keys_scan(uint8_t mode);

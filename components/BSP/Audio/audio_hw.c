@@ -66,6 +66,31 @@ static void es8388_i2s_cfg(uint8_t fmt, uint8_t len)
     codec_write(23, (fmt << 1) | (len << 3));
 }
 
+static void es8388_dac_ratio_cfg(uint32_t sample_rate)
+{
+    /* Configure DAC clock divider based on sample rate
+     * MCLK = sample_rate * 256 (I2S_MCLK_MULT = 256)
+     * DAC_ratio should match the sample rate:
+     * 0x02 for 44.1kHz, 0x06 for 48kHz, 0x01 for 32kHz, etc.
+     */
+    uint8_t dac_ratio = 0x02; /* Default for 44.1kHz */
+    
+    if (sample_rate <= 16000) {
+        dac_ratio = 0x00; /* 8kHz, 16kHz */
+    } else if (sample_rate <= 32000) {
+        dac_ratio = 0x01; /* 32kHz */
+    } else if (sample_rate <= 48000) {
+        dac_ratio = 0x02; /* 44.1kHz, 48kHz */
+    } else if (sample_rate <= 96000) {
+        dac_ratio = 0x04; /* 96kHz */
+    } else {
+        dac_ratio = 0x05; /* 192kHz */
+    }
+    
+    codec_write(0x18, dac_ratio);
+    ESP_LOGI(TAG, "DAC ratio set to 0x%02x for sample rate %lu Hz", dac_ratio, sample_rate);
+}
+
 static void es8388_adda_cfg(uint8_t dacen, uint8_t adcen)
 {
     uint8_t tempreg = 0;
@@ -257,6 +282,9 @@ esp_err_t audio_hw_configure(uint32_t sample_rate_hz, uint8_t bits_per_sample, u
         len_cfg = 4;
     }
     es8388_i2s_cfg(0, len_cfg);
+    
+    /* Reconfigure DAC ratio to match sample rate */
+    es8388_dac_ratio_cfg(sample_rate_hz);
 
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_tx_handle), TAG, "enable after cfg");
     s_i2s_enabled = true;

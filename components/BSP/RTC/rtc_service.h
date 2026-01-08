@@ -24,6 +24,8 @@ bool rtc_get_time(rtc_calendar_t *out_calendar);
 bool rtc_sync_time_from_ntp(uint32_t wait_ms);
 esp_err_t rtc_start_periodic_sync(uint32_t interval_ms);
 void rtc_stop_periodic_sync(void);
+bool rtc_time_is_valid(void);
+esp_err_t rtc_do_sync_now(uint32_t wait_ms);
 
 #ifdef __cplusplus
 }

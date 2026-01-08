@@ -30,9 +30,14 @@
 
 // 命令字 - 人体存在/运动 (CTRL_HUMAN_PRESENCE 0x80)
 #define CMD_MOTION_INFO       0x02 // 运动信息 (静止/活跃)
-#define CMD_BODY_MOVEMENT     0x03 // 体动参数
+#define CMD_BODY_MOVEMENT     0x83 // 体动参数 (查询命令字)
+#define CMD_BODY_MOVEMENT_RPT 0x83 // 体动参数回复 (数据包含1B标识)
 #define CMD_HUMAN_DISTANCE    0x04 // 人体距离
 #define CMD_HUMAN_ORIENTATION 0x05 // 人体方位
+
+// 查询命令数据标识
+#define DATA_QUERY            0x0F // 查询指令数据
+#define DATA_REPORT           0x1B // 上报数据标识
 
 // 命令字 - 呼吸 (CTRL_BREATH 0x81)
 #define CMD_BREATH_VALUE      0x02 // 呼吸数值
@@ -80,5 +85,16 @@ int protocol_pack_heart_rate_switch(uint8_t enable, uint8_t *out_buf, uint16_t *
  * @return int          0: 成功解析一帧, -1: 格式错误或校验失败, -2: 数据不足
  */
 int protocol_parse_frame(const uint8_t *buffer, uint16_t len, uint8_t *out_ctrl, uint8_t *out_cmd, uint8_t **out_data, uint16_t *out_data_len);
+
+/**
+ * @brief 构建体动参数查询指令帧
+ * 
+ * 帧结构: 53 59 80 83 00 01 0F sum 54 43
+ * 
+ * @param out_buf   输出缓冲区
+ * @param out_len   输入时为缓冲区大小，输出时为实际帧长度
+ * @return int      0: 成功, -1: 缓冲区过小
+ */
+int protocol_pack_motion_query(uint8_t *out_buf, uint16_t *out_len);
 
 #endif // PROTOCOL_H
