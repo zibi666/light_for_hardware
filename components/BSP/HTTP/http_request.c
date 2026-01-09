@@ -26,10 +26,10 @@
 #define WIFI_RECONNECT_PERIOD_MS 10000
 
 // 服务器配置
-#define SERVER_URL     "http://192.168.1.108:8080/api/health/upload"
+#define SERVER_URL     "http://192.168.1.108:6060/api/health/upload"
 
 #define ALARM_DEFAULT_HOST   "192.168.1.108"
-#define ALARM_DEFAULT_PORT   8080
+#define ALARM_DEFAULT_PORT   6060
 #define ALARM_FETCH_PERIOD_MS 60000
 #define ALARM_TASK_STACK      6144
 #define ALARM_TASK_PRIO       4
