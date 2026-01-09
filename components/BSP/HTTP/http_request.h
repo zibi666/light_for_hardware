@@ -10,6 +10,7 @@
 typedef struct {
     int heart_rate;
     int breathing_rate;
+    char sleep_status[32];
 } health_data_t;
 
 #define ALARM_MAX_COUNT       16

@@ -441,6 +441,10 @@ esp_err_t http_send_health_data(const health_data_t *data)
     char *post_data = NULL;
     esp_err_t err = ESP_FAIL;
 
+    if (!data) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if (!wifi_wait_connected(5000)) {
         ESP_LOGE(TAG, "Wi-Fi not connected, skip upload");
         return ESP_FAIL;
@@ -463,6 +467,7 @@ esp_err_t http_send_health_data(const health_data_t *data)
     }
     cJSON_AddNumberToObject(root, "heartRate", data->heart_rate);
     cJSON_AddNumberToObject(root, "breathingRate", data->breathing_rate);
+    cJSON_AddStringToObject(root, "sleepStatus", data->sleep_status[0] ? data->sleep_status : "UNKNOWN");
 
     post_data = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);

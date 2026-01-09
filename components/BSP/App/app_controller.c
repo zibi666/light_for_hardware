@@ -3,8 +3,10 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "protocol.h"
 #include "http_request.h"
@@ -16,14 +18,6 @@ static const char *TAG = "app_ctrl";
 static int g_heart_rate = 0;
 static int g_breathing_rate = 0;
 static float g_motion_index = 0.0f;
-
-/* 30秒epoch内的累积器（用于计算平均值） */
-static float g_hr_accum = 0.0f;
-static uint32_t g_hr_samples = 0;
-static float g_rr_accum = 0.0f;
-static uint32_t g_rr_samples = 0;
-static float g_motion_accum = 0.0f;
-static uint32_t g_motion_samples = 0;
 
 /* 睡眠状态 */
 typedef enum
@@ -43,6 +37,9 @@ static sleep_state_t g_sleep_state = SLEEP_MONITORING;
 #define MOTION_WAKE_THRESH   30.0f    /* 清醒体动阈值，更敏感 */
 #define HR_WAKE_THRESH       80.0f    /* 心率高于此值认为清醒 */
 #define HR_DROP_REQUIRED     5.0f     /* 心率需下降至少5bpm */
+#define SENSOR_WARMUP_EPOCHS 2U
+#define RADAR_SAMPLES_PER_EPOCH 10U
+#define THRESH_WINDOW_EPOCHS 40U
 
 /* 入睡观察计数器 */
 static uint32_t g_settling_count = 0;
@@ -57,6 +54,32 @@ static sleep_quality_report_t g_report = {0};
 
 static bool s_started = false;
 
+static QueueHandle_t s_health_queue = NULL;
+#define HEALTH_QUEUE_LEN 16
+
+static portMUX_TYPE s_radar_sample_mux = portMUX_INITIALIZER_UNLOCKED;
+static radar_sample_t s_radar_sample_ring[RADAR_SAMPLES_PER_EPOCH];
+static size_t s_radar_sample_count = 0;
+static size_t s_radar_sample_head = 0;
+
+static void radar_sample_push(uint8_t heart_rate_bpm, uint8_t respiratory_rate_bpm, uint8_t motion_level)
+{
+    radar_sample_t sample = {
+        .heart_rate_bpm = heart_rate_bpm,
+        .respiratory_rate_bpm = respiratory_rate_bpm,
+        .motion_level = motion_level,
+        .timestamp = (uint32_t)time(NULL),
+    };
+
+    portENTER_CRITICAL(&s_radar_sample_mux);
+    s_radar_sample_ring[s_radar_sample_head] = sample;
+    s_radar_sample_head = (s_radar_sample_head + 1) % RADAR_SAMPLES_PER_EPOCH;
+    if (s_radar_sample_count < RADAR_SAMPLES_PER_EPOCH) {
+        s_radar_sample_count++;
+    }
+    portEXIT_CRITICAL(&s_radar_sample_mux);
+}
+
 /* 睡眠阶段转字符串 */
 static const char *stage_to_str(sleep_stage_t s)
 {
@@ -66,6 +89,17 @@ static const char *stage_to_str(sleep_stage_t s)
     case SLEEP_STAGE_REM:  return "REM睡眠";
     case SLEEP_STAGE_NREM: return "深度睡眠";
     default: return "未知";
+    }
+}
+
+static const char *stage_to_cloud_str(sleep_stage_t s)
+{
+    switch (s)
+    {
+    case SLEEP_STAGE_WAKE: return "WAKE";
+    case SLEEP_STAGE_REM:  return "REM";
+    case SLEEP_STAGE_NREM: return "NREM";
+    default: return "UNKNOWN";
     }
 }
 
@@ -82,35 +116,34 @@ static void upload_data_task(void *pvParameters)
 {
     while (1)
     {
-        if (!wifi_wait_connected(5000))
+        if (!s_health_queue)
         {
-            printf("Wi-Fi未连接，跳过上传\n");
-            vTaskDelay(pdMS_TO_TICKS(30000));
+            vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
 
-        health_data_t data = {
-            .heart_rate = g_heart_rate,
-            .breathing_rate = g_breathing_rate
-        };
-
-        if (g_heart_rate > 0 || g_breathing_rate > 0)
+        health_data_t data = {0};
+        if (xQueueReceive(s_health_queue, &data, pdMS_TO_TICKS(1000)) == pdTRUE)
         {
-            printf("正在上传数据 - 心率:%d 呼吸:%d\n", data.heart_rate, data.breathing_rate);
-            http_send_health_data(&data);
+            if (data.heart_rate <= 0 && data.breathing_rate <= 0)
+            {
+                continue;
+            }
+            printf("正在上传数据 - 心率:%d 呼吸:%d 阶段:%s\n", data.heart_rate, data.breathing_rate, data.sleep_status);
+            esp_err_t err = http_send_health_data(&data);
+            if (err != ESP_OK)
+            {
+                vTaskDelay(pdMS_TO_TICKS(10000));
+                (void)xQueueSend(s_health_queue, &data, 0);
+            }
         }
-        else
-        {
-            printf("暂无有效数据，跳过上传\n");
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(30000));
     }
 }
 
 static void sleep_stage_task(void *pvParameters)
 {
     const TickType_t period = pdMS_TO_TICKS(EPOCH_MS);
+    uint32_t warmup_left = SENSOR_WARMUP_EPOCHS;
     
     printf("\n========== 睡眠监测已启动 ==========\n");
     printf("入睡判定条件: 连续%u分钟低体动(<%.0f) + 心率下降\n", 
@@ -118,33 +151,70 @@ static void sleep_stage_task(void *pvParameters)
 
     while (1)
     {
-        /* 1. 采集当前30秒窗口的数据（使用平均值，符合论文方法） */
-        float motion_avg = (g_motion_samples > 0) ? (g_motion_accum / (float)g_motion_samples) : g_motion_index;
-        float hr_avg = (g_hr_samples > 0) ? (g_hr_accum / (float)g_hr_samples) : (float)g_heart_rate;
-        float rr_avg = (g_rr_samples > 0) ? (g_rr_accum / (float)g_rr_samples) : (float)g_breathing_rate;
-        
-        /* 计算心率标准差（用于HRV估算） */
-        float hr_std = 2.0f;  /* 默认值 */
-        if (g_hr_samples >= 2) {
-            /* 简化计算：使用最大最小差值估算 */
-            hr_std = (g_hr_accum > 0) ? (hr_avg * 0.05f) : 2.0f;  /* 约5%变异 */
+        radar_sample_t samples[RADAR_SAMPLES_PER_EPOCH] = {0};
+        size_t copied = 0;
+        portENTER_CRITICAL(&s_radar_sample_mux);
+        if (s_radar_sample_count >= RADAR_SAMPLES_PER_EPOCH) {
+            for (size_t i = 0; i < RADAR_SAMPLES_PER_EPOCH; ++i) {
+                const size_t idx = (s_radar_sample_head + i) % RADAR_SAMPLES_PER_EPOCH;
+                samples[i] = s_radar_sample_ring[idx];
+            }
+            copied = RADAR_SAMPLES_PER_EPOCH;
         }
-        
-        sleep_epoch_t epoch = {
-            .respiratory_rate_bpm = rr_avg,
-            .motion_index = motion_avg,
-            .heart_rate_mean = hr_avg,
-            .heart_rate_std = hr_std,
-            .duration_seconds = 30
-        };
+        portEXIT_CRITICAL(&s_radar_sample_mux);
 
-        /* 重置所有累积器 */
-        g_hr_accum = 0.0f;
-        g_hr_samples = 0;
-        g_rr_accum = 0.0f;
-        g_rr_samples = 0;
-        g_motion_accum = 0.0f;
-        g_motion_samples = 0;
+        if (copied < RADAR_SAMPLES_PER_EPOCH) {
+            vTaskDelay(period);
+            continue;
+        }
+
+        size_t valid_rr_count = 0;
+        size_t valid_hr_count = 0;
+        float motion_sum = 0.0f;
+        float motion_max = 0.0f;
+        for (size_t i = 0; i < RADAR_SAMPLES_PER_EPOCH; ++i) {
+            const uint8_t rr = samples[i].respiratory_rate_bpm;
+            const uint8_t hr = samples[i].heart_rate_bpm;
+            const float mv = (float)samples[i].motion_level;
+            if (rr > 0 && rr <= 35) valid_rr_count++;
+            if (hr >= 60 && hr <= 120) valid_hr_count++;
+            motion_sum += mv;
+            if (mv > motion_max) motion_max = mv;
+        }
+        const float motion_avg = motion_sum / (float)RADAR_SAMPLES_PER_EPOCH;
+
+        sleep_epoch_t epoch = {0};
+        const size_t epoch_n = sleep_analysis_aggregate_samples(samples, copied, &epoch, 1);
+        if (epoch_n == 0) {
+            vTaskDelay(period);
+            continue;
+        }
+        if (valid_rr_count == 0) {
+            epoch.respiratory_rate_bpm = 0.0f;
+        }
+        if (valid_hr_count == 0) {
+            epoch.heart_rate_mean = 0.0f;
+            epoch.heart_rate_std = 0.0f;
+        }
+
+        epoch.motion_index = motion_max;
+
+        const float hr_avg = epoch.heart_rate_mean;
+        const float rr_avg = epoch.respiratory_rate_bpm;
+
+        const bool has_valid_epoch = (valid_hr_count > 0) || (valid_rr_count > 0);
+        if (warmup_left > 0) {
+            if (has_valid_epoch) {
+                warmup_left--;
+            }
+            vTaskDelay(period);
+            continue;
+        }
+
+        if (!has_valid_epoch) {
+            vTaskDelay(period);
+            continue;
+        }
 
         /* 2. 存储epoch数据 */
         if (g_epoch_count >= MAX_SLEEP_EPOCHS)
@@ -243,7 +313,13 @@ static void sleep_stage_task(void *pvParameters)
         
         if (g_sleep_state == SLEEP_SLEEPING && g_epoch_count >= ONSET_WINDOW_EPOCHS)
         {
-            sleep_analysis_compute_thresholds(g_epochs, g_epoch_count, &g_thresholds);
+            size_t thr_count = g_epoch_count;
+            size_t thr_start = 0;
+            if (thr_count > THRESH_WINDOW_EPOCHS) {
+                thr_start = thr_count - THRESH_WINDOW_EPOCHS;
+                thr_count = THRESH_WINDOW_EPOCHS;
+            }
+            sleep_analysis_compute_thresholds(&g_epochs[thr_start], thr_count, &g_thresholds);
             sleep_analysis_detect_stages(g_epochs, g_epoch_count, &g_thresholds, g_stage_results);
             current_stage = g_stage_results[g_epoch_count - 1].stage;
             
@@ -291,6 +367,28 @@ static void sleep_stage_task(void *pvParameters)
         /* 5. 计算睡眠质量报告 */
         sleep_analysis_build_quality(g_epochs, g_stage_results, g_epoch_count, &g_report);
 
+        if (s_health_queue && g_epoch_count > 0)
+        {
+            const sleep_stage_result_t *last = &g_stage_results[g_epoch_count - 1];
+            health_data_t data = {0};
+            data.heart_rate = (int)(last->heart_rate_mean + 0.5f);
+            data.breathing_rate = (int)(last->respiratory_rate_bpm + 0.5f);
+            snprintf(data.sleep_status, sizeof(data.sleep_status), "%s", stage_to_cloud_str(last->stage));
+
+            if (data.heart_rate <= 0 && data.breathing_rate <= 0)
+            {
+                vTaskDelay(period);
+                continue;
+            }
+
+            if (xQueueSend(s_health_queue, &data, 0) != pdTRUE)
+            {
+                health_data_t dropped = {0};
+                (void)xQueueReceive(s_health_queue, &dropped, 0);
+                (void)xQueueSend(s_health_queue, &data, 0);
+            }
+        }
+
         /* 6. 输出睡眠状态 */
         const char *state_str = (g_sleep_state == SLEEP_MONITORING) ? "监测中" :
                                 (g_sleep_state == SLEEP_SETTLING) ? "观察期" : "睡眠中";
@@ -300,8 +398,8 @@ static void sleep_stage_task(void *pvParameters)
         printf("╠════════════════════════════════════════╣\n");
         printf("║ 监测状态: %-28s ║\n", state_str);
         printf("║ 睡眠阶段: %-28s ║\n", stage_to_str(current_stage));
-        printf("║ 呼吸频率: %-3d 次/分                     ║\n", g_breathing_rate);
-        printf("║ 心率:     %-3d bpm                       ║\n", g_heart_rate);
+        printf("║ 呼吸频率: %-3d 次/分                     ║\n", (int)(rr_avg + 0.5f));
+        printf("║ 心率:     %-3d bpm                       ║\n", (int)(hr_avg + 0.5f));
         printf("║ 体动指数: %-5.1f                         ║\n", motion_avg);
         printf("╠════════════════════════════════════════╣\n");
         
@@ -392,9 +490,6 @@ static void uart_rx_task(void *pvParameters)
                             if (heart_rate >= 60 && heart_rate <= 120)
                             {
                                 g_heart_rate = heart_rate;
-                                /* 累积用于计算平均值 */
-                                g_hr_accum += (float)heart_rate;
-                                g_hr_samples++;
                                 printf("心率: %d bpm\n", heart_rate);
                             }
                         }
@@ -409,11 +504,8 @@ static void uart_rx_task(void *pvParameters)
                             if (breath <= 35)
                             {
                                 g_breathing_rate = breath;
-                                /* 累积用于计算平均值（只累积有效值） */
                                 if (breath > 0)
                                 {
-                                    g_rr_accum += (float)breath;
-                                    g_rr_samples++;
                                     printf("呼吸频率: %d 次/分\n", breath);
                                 }
                             }
@@ -429,9 +521,10 @@ static void uart_rx_task(void *pvParameters)
                             if (movement <= 100)
                             {
                                 g_motion_index = (float)movement;
-                                g_motion_accum += g_motion_index;
-                                g_motion_samples++;
                                 printf("体动参数: %d\n", movement);
+                                const uint8_t hr = (g_heart_rate >= 60 && g_heart_rate <= 120) ? (uint8_t)g_heart_rate : 0;
+                                const uint8_t rr = (g_breathing_rate > 0 && g_breathing_rate <= 35) ? (uint8_t)g_breathing_rate : 0;
+                                radar_sample_push(hr, rr, movement);
                             }
                         }
                     }
@@ -450,6 +543,13 @@ esp_err_t app_controller_start(void)
     if (s_started)
     {
         return ESP_OK;
+    }
+
+    s_health_queue = xQueueCreate(HEALTH_QUEUE_LEN, sizeof(health_data_t));
+    if (!s_health_queue)
+    {
+        ESP_LOGE(TAG, "create health queue failed");
+        return ESP_FAIL;
     }
 
     BaseType_t r1 = xTaskCreate(upload_data_task, "upload_data_task", 4096, NULL, 5, NULL);
