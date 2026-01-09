@@ -71,6 +71,18 @@ int protocol_pack_heart_rate_switch(uint8_t enable, uint8_t *out_buf, uint16_t *
     return protocol_build_frame(CTRL_HEART_RATE, CMD_HEART_RATE_SWITCH, &data, 1, out_buf, out_len);
 }
 
+int protocol_pack_motion_query(uint8_t *out_buf, uint16_t *out_len)
+{
+    /* 
+     * 体动参数查询帧: 53 59 80 83 00 01 0F sum 54 43
+     * 控制字: 0x80 (人体存在)
+     * 命令字: 0x83 (体动参数)
+     * 数据: 0x0F (查询标识)
+     */
+    uint8_t data = DATA_QUERY;
+    return protocol_build_frame(CTRL_HUMAN_PRESENCE, CMD_BODY_MOVEMENT, &data, 1, out_buf, out_len);
+}
+
 int protocol_parse_frame(const uint8_t *buffer, uint16_t len, uint8_t *out_ctrl, uint8_t *out_cmd, uint8_t **out_data, uint16_t *out_data_len)
 {
     if (len < MIN_FRAME_LEN) {

@@ -16,44 +16,66 @@ static const char *TAG = "app_ctrl";
 static int g_heart_rate = 0;
 static int g_breathing_rate = 0;
 static float g_motion_index = 0.0f;
+
+/* 30秒epoch内的累积器（用于计算平均值） */
+static float g_hr_accum = 0.0f;
+static uint32_t g_hr_samples = 0;
+static float g_rr_accum = 0.0f;
+static uint32_t g_rr_samples = 0;
 static float g_motion_accum = 0.0f;
 static uint32_t g_motion_samples = 0;
 
+/* 睡眠状态 */
 typedef enum
 {
-    SLEEP_WARMUP = 0,
-    SLEEP_SETTLING,
-    SLEEP_ACTIVE
+    SLEEP_MONITORING = 0,  /* 监测中（未入睡或已醒来） */
+    SLEEP_SETTLING,        /* 入睡观察期 */
+    SLEEP_SLEEPING         /* 睡眠中 */
 } sleep_state_t;
 
-static sleep_state_t g_sleep_state = SLEEP_WARMUP;
-static TickType_t g_start_tick = 0;
-static size_t g_sleep_start_index = SIZE_MAX;
+static sleep_state_t g_sleep_state = SLEEP_MONITORING;
 
-#define WARMUP_MS            60000U
-#define EPOCH_MS             30000U
-#define ONSET_WINDOW_EPOCHS  2U
-#define MOTION_ONSET_MAX     5.0f
-#define RESP_ONSET_MIN       10.0f
-#define RESP_ONSET_MAX       25.0f
+#define EPOCH_MS             30000U   /* 每30秒分析一次 */
+#define ONSET_WINDOW_EPOCHS  10U      /* 入睡观察期: 10个epoch = 5分钟 */
+#define MOTION_SLEEP_MAX     15.0f    /* 入睡体动阈值(0-100)，更严格 */
+#define RESP_SLEEP_MIN       8.0f     /* 入睡呼吸最小值 */
+#define RESP_SLEEP_MAX       22.0f    /* 入睡呼吸最大值，更严格 */
+#define MOTION_WAKE_THRESH   30.0f    /* 清醒体动阈值，更敏感 */
+#define HR_WAKE_THRESH       80.0f    /* 心率高于此值认为清醒 */
+#define HR_DROP_REQUIRED     5.0f     /* 心率需下降至少5bpm */
+
+/* 入睡观察计数器 */
+static uint32_t g_settling_count = 0;
+static float g_baseline_hr = 0.0f;   /* 基线心率（开始监测时的心率） */
 
 #define MAX_SLEEP_EPOCHS 512
 static sleep_epoch_t g_epochs[MAX_SLEEP_EPOCHS];
 static sleep_stage_result_t g_stage_results[MAX_SLEEP_EPOCHS];
 static size_t g_epoch_count = 0;
 static sleep_thresholds_t g_thresholds = {0};
+static sleep_quality_report_t g_report = {0};
 
 static bool s_started = false;
 
+/* 睡眠阶段转字符串 */
 static const char *stage_to_str(sleep_stage_t s)
 {
     switch (s)
     {
     case SLEEP_STAGE_WAKE: return "清醒";
-    case SLEEP_STAGE_REM:  return "REM";
-    case SLEEP_STAGE_NREM: return "非REM";
+    case SLEEP_STAGE_REM:  return "REM睡眠";
+    case SLEEP_STAGE_NREM: return "深度睡眠";
     default: return "未知";
     }
+}
+
+/* 睡眠质量等级 */
+static const char *quality_to_str(float score)
+{
+    if (score >= 85.0f) return "优秀";
+    if (score >= 70.0f) return "良好";
+    if (score >= 50.0f) return "一般";
+    return "较差";
 }
 
 static void upload_data_task(void *pvParameters)
@@ -89,130 +111,219 @@ static void upload_data_task(void *pvParameters)
 static void sleep_stage_task(void *pvParameters)
 {
     const TickType_t period = pdMS_TO_TICKS(EPOCH_MS);
-    sleep_quality_report_t report;
-    g_start_tick = xTaskGetTickCount();
+    
+    printf("\n========== 睡眠监测已启动 ==========\n");
+    printf("入睡判定条件: 连续%u分钟低体动(<%.0f) + 心率下降\n", 
+           ONSET_WINDOW_EPOCHS / 2, MOTION_SLEEP_MAX);
 
     while (1)
     {
-        if (g_sleep_state == SLEEP_WARMUP)
-        {
-            TickType_t elapsed = xTaskGetTickCount() - g_start_tick;
-            if (elapsed < pdMS_TO_TICKS(WARMUP_MS))
-            {
-                g_motion_accum = 0.0f;
-                g_motion_samples = 0;
-                g_breathing_rate = 0;
-                g_heart_rate = 0;
-                vTaskDelay(period);
-                continue;
-            }
-            g_sleep_state = SLEEP_SETTLING;
-            g_sleep_start_index = SIZE_MAX;
-        }
-
+        /* 1. 采集当前30秒窗口的数据（使用平均值，符合论文方法） */
         float motion_avg = (g_motion_samples > 0) ? (g_motion_accum / (float)g_motion_samples) : g_motion_index;
+        float hr_avg = (g_hr_samples > 0) ? (g_hr_accum / (float)g_hr_samples) : (float)g_heart_rate;
+        float rr_avg = (g_rr_samples > 0) ? (g_rr_accum / (float)g_rr_samples) : (float)g_breathing_rate;
+        
+        /* 计算心率标准差（用于HRV估算） */
+        float hr_std = 2.0f;  /* 默认值 */
+        if (g_hr_samples >= 2) {
+            /* 简化计算：使用最大最小差值估算 */
+            hr_std = (g_hr_accum > 0) ? (hr_avg * 0.05f) : 2.0f;  /* 约5%变异 */
+        }
+        
         sleep_epoch_t epoch = {
-            .respiratory_rate_bpm = (g_breathing_rate > 0) ? (float)g_breathing_rate : 0.0f,
+            .respiratory_rate_bpm = rr_avg,
             .motion_index = motion_avg,
+            .heart_rate_mean = hr_avg,
+            .heart_rate_std = hr_std,
             .duration_seconds = 30
         };
 
+        /* 重置所有累积器 */
+        g_hr_accum = 0.0f;
+        g_hr_samples = 0;
+        g_rr_accum = 0.0f;
+        g_rr_samples = 0;
         g_motion_accum = 0.0f;
         g_motion_samples = 0;
 
+        /* 2. 存储epoch数据 */
         if (g_epoch_count >= MAX_SLEEP_EPOCHS)
         {
             memmove(&g_epochs[0], &g_epochs[1], (MAX_SLEEP_EPOCHS - 1) * sizeof(sleep_epoch_t));
             memmove(&g_stage_results[0], &g_stage_results[1], (MAX_SLEEP_EPOCHS - 1) * sizeof(sleep_stage_result_t));
-            if (g_sleep_start_index != SIZE_MAX)
-            {
-                g_sleep_start_index = (g_sleep_start_index > 0) ? (g_sleep_start_index - 1) : 0;
-            }
             g_epoch_count = MAX_SLEEP_EPOCHS - 1;
         }
-
         g_epochs[g_epoch_count] = epoch;
         g_epoch_count++;
 
-        if (g_sleep_state == SLEEP_SETTLING && g_epoch_count >= ONSET_WINDOW_EPOCHS)
+        /* 3. 入睡状态机 */
+        sleep_stage_t current_stage = SLEEP_STAGE_WAKE;
+        bool is_quiet = (motion_avg < MOTION_SLEEP_MAX) && 
+                        (rr_avg >= RESP_SLEEP_MIN && rr_avg <= RESP_SLEEP_MAX) &&
+                        (rr_avg > 0);  /* 呼吸数据必须有效 */
+        bool is_active = (motion_avg > MOTION_WAKE_THRESH) || (hr_avg > HR_WAKE_THRESH);
+        
+        switch (g_sleep_state)
         {
-            float m_sum = 0.0f, r_sum = 0.0f;
-            size_t start = g_epoch_count - ONSET_WINDOW_EPOCHS;
-            for (size_t i = start; i < g_epoch_count; ++i)
+        case SLEEP_MONITORING:
+            /* 记录基线心率 */
+            if (g_baseline_hr < 1.0f && hr_avg > 50.0f)
             {
-                m_sum += g_epochs[i].motion_index;
-                r_sum += g_epochs[i].respiratory_rate_bpm;
+                g_baseline_hr = hr_avg;
+                printf("[睡眠] 基线心率: %.0f bpm\n", g_baseline_hr);
             }
-            float m_mean = m_sum / (float)ONSET_WINDOW_EPOCHS;
-            float r_mean = r_sum / (float)ONSET_WINDOW_EPOCHS;
-            if (m_mean < MOTION_ONSET_MAX && r_mean >= RESP_ONSET_MIN && r_mean <= RESP_ONSET_MAX)
+            
+            if (is_quiet && !is_active)
             {
-                g_sleep_state = SLEEP_ACTIVE;
-                g_sleep_start_index = g_epoch_count;
-                printf("[睡眠] 检测到入睡，m=%.2f r=%.2f\n", m_mean, r_mean);
+                /* 开始入睡观察 */
+                g_sleep_state = SLEEP_SETTLING;
+                g_settling_count = 1;
+                printf("[睡眠] 进入观察期 (%lu/%u)\n", (unsigned long)g_settling_count, ONSET_WINDOW_EPOCHS);
             }
+            break;
+            
+        case SLEEP_SETTLING:
+            if (is_active)
+            {
+                /* 活动太大，重置 */
+                g_sleep_state = SLEEP_MONITORING;
+                g_settling_count = 0;
+                printf("[睡眠] 观察期中断(体动%.1f/心率%.0f)，重新监测\n", motion_avg, hr_avg);
+            }
+            else if (is_quiet)
+            {
+                g_settling_count++;
+                printf("[睡眠] 观察期进行中 (%lu/%u)\n", (unsigned long)g_settling_count, ONSET_WINDOW_EPOCHS);
+                
+                /* 检查是否满足入睡条件 */
+                if (g_settling_count >= ONSET_WINDOW_EPOCHS)
+                {
+                    /* 检查心率是否有下降趋势 */
+                    float hr_drop = g_baseline_hr - hr_avg;
+                    if (hr_drop >= HR_DROP_REQUIRED || hr_avg < 75.0f)
+                    {
+                        g_sleep_state = SLEEP_SLEEPING;
+                        printf("[睡眠] ★ 确认入睡! 心率从%.0f降至%.0f (降%.0f)\n", 
+                               g_baseline_hr, hr_avg, hr_drop);
+                    }
+                    else
+                    {
+                        printf("[睡眠] 体动低但心率未下降(%.0f→%.0f)，继续观察\n", 
+                               g_baseline_hr, hr_avg);
+                        /* 保持在观察期，不重置计数 */
+                    }
+                }
+            }
+            else
+            {
+                /* 不够安静，减少计数 */
+                if (g_settling_count > 0) g_settling_count--;
+                if (g_settling_count == 0)
+                {
+                    g_sleep_state = SLEEP_MONITORING;
+                    printf("[睡眠] 观察期结束，未入睡\n");
+                }
+            }
+            break;
+            
+        case SLEEP_SLEEPING:
+            if (is_active)
+            {
+                /* 醒来了 */
+                g_sleep_state = SLEEP_MONITORING;
+                g_settling_count = 0;
+                g_baseline_hr = hr_avg;  /* 重新设置基线 */
+                printf("[睡眠] ★ 检测到觉醒 (体动%.1f/心率%.0f)\n", motion_avg, hr_avg);
+            }
+            break;
         }
 
-        for (size_t i = 0; i < g_epoch_count; ++i)
+        /* 4. 睡眠阶段分析（仅在确认睡眠后） */
+        static uint32_t s_wake_count = 0;  /* 连续WAKE计数器 */
+        
+        if (g_sleep_state == SLEEP_SLEEPING && g_epoch_count >= ONSET_WINDOW_EPOCHS)
         {
-            if (g_sleep_start_index == SIZE_MAX || i < g_sleep_start_index)
+            sleep_analysis_compute_thresholds(g_epochs, g_epoch_count, &g_thresholds);
+            sleep_analysis_detect_stages(g_epochs, g_epoch_count, &g_thresholds, g_stage_results);
+            current_stage = g_stage_results[g_epoch_count - 1].stage;
+            
+            /* 如果论文算法判定为WAKE，检查是否真的觉醒 */
+            if (current_stage == SLEEP_STAGE_WAKE)
+            {
+                s_wake_count++;
+                
+                if (s_wake_count >= 3)
+                {
+                    /* 连续3次WAKE（1.5分钟），真的觉醒了 */
+                    g_sleep_state = SLEEP_MONITORING;
+                    g_settling_count = 0;
+                    g_baseline_hr = hr_avg;
+                    s_wake_count = 0;
+                    printf("[睡眠] ★ 算法检测到觉醒\n");
+                }
+                else
+                {
+                    /* 可能是短暂微觉醒，保持睡眠状态，标记为浅睡 */
+                    current_stage = SLEEP_STAGE_NREM;
+                    printf("[睡眠] 微觉醒信号 (%lu/3)，继续监测\n", (unsigned long)s_wake_count);
+                }
+            }
+            else
+            {
+                /* 非WAKE，重置觉醒计数 */
+                s_wake_count = 0;
+            }
+        }
+        else
+        {
+            s_wake_count = 0;  /* 未在睡眠状态，重置计数 */
+            /* 未入睡，全部标记为清醒 */
+            for (size_t i = 0; i < g_epoch_count; ++i)
             {
                 g_stage_results[i].stage = SLEEP_STAGE_WAKE;
                 g_stage_results[i].respiratory_rate_bpm = g_epochs[i].respiratory_rate_bpm;
                 g_stage_results[i].motion_index = g_epochs[i].motion_index;
+                g_stage_results[i].heart_rate_mean = g_epochs[i].heart_rate_mean;
+                g_stage_results[i].heart_rate_std = g_epochs[i].heart_rate_std;
             }
         }
 
-        const sleep_epoch_t *sleep_ptr = NULL;
-        size_t sleep_count = 0;
-        if (g_sleep_start_index != SIZE_MAX && g_sleep_start_index < g_epoch_count)
-        {
-            sleep_ptr = &g_epochs[g_sleep_start_index];
-            sleep_count = g_epoch_count - g_sleep_start_index;
-        }
+        /* 5. 计算睡眠质量报告 */
+        sleep_analysis_build_quality(g_epochs, g_stage_results, g_epoch_count, &g_report);
 
-        if (sleep_count > 0)
+        /* 6. 输出睡眠状态 */
+        const char *state_str = (g_sleep_state == SLEEP_MONITORING) ? "监测中" :
+                                (g_sleep_state == SLEEP_SETTLING) ? "观察期" : "睡眠中";
+        
+        printf("\n╔════════════════════════════════════════╗\n");
+        printf("║           睡眠监测报告                  ║\n");
+        printf("╠════════════════════════════════════════╣\n");
+        printf("║ 监测状态: %-28s ║\n", state_str);
+        printf("║ 睡眠阶段: %-28s ║\n", stage_to_str(current_stage));
+        printf("║ 呼吸频率: %-3d 次/分                     ║\n", g_breathing_rate);
+        printf("║ 心率:     %-3d bpm                       ║\n", g_heart_rate);
+        printf("║ 体动指数: %-5.1f                         ║\n", motion_avg);
+        printf("╠════════════════════════════════════════╣\n");
+        
+        if (g_sleep_state == SLEEP_SLEEPING)
         {
-            sleep_analysis_compute_thresholds(sleep_ptr, sleep_count, &g_thresholds);
-            sleep_analysis_detect_stages(sleep_ptr, sleep_count, &g_thresholds, &g_stage_results[g_sleep_start_index]);
+            printf("║ 睡眠评分: %-5.1f (%s)                 ║\n", 
+                   g_report.sleep_score, quality_to_str(g_report.sleep_score));
+            printf("║ 睡眠效率: %-5.1f%%                       ║\n", g_report.sleep_efficiency * 100.0f);
+            printf("║ REM占比:  %-5.1f%%                       ║\n", g_report.rem_ratio * 100.0f);
+            printf("║ 深睡时长: %-4lu 秒                      ║\n", (unsigned long)g_report.nrem_seconds);
+            printf("║ 平均心率: %-5.1f bpm                    ║\n", g_report.average_heart_rate);
+        }
+        else if (g_sleep_state == SLEEP_SETTLING)
+        {
+            printf("║ 入睡观察: %lu/%u (%.1f分钟)             ║\n",
+                   (unsigned long)g_settling_count, ONSET_WINDOW_EPOCHS, g_settling_count * 0.5f);
         }
         else
         {
-            memset(&g_thresholds, 0, sizeof(g_thresholds));
+            printf("║ [等待入睡信号...]                       ║\n");
         }
-
-        sleep_analysis_build_quality(g_epochs, g_stage_results, g_epoch_count, &report);
-
-        if (g_epoch_count >= 5)
-        {
-            if (g_thresholds.motion_threshold < 1.0f || g_thresholds.resp_rate_threshold < 5.0f)
-            {
-                printf("[睡眠][告警] 阈值异常: RR_thres=%.2f Mov_thres=%.2f (可能输入数据为 0)\n",
-                       g_thresholds.resp_rate_threshold,
-                       g_thresholds.motion_threshold);
-            }
-        }
-
-        if (g_epoch_count > 0)
-        {
-            const sleep_stage_result_t *last = &g_stage_results[g_epoch_count - 1];
-            if (g_sleep_state != SLEEP_ACTIVE || sleep_count == 0)
-            {
-                printf("[睡眠] 未入睡/暖机或未满足条件，强制清醒。呼吸:%.1f 体动:%.2f\n",
-                       last->respiratory_rate_bpm,
-                       last->motion_index);
-            }
-            else
-            {
-                printf("[睡眠] 阶段:%s 呼吸:%.1f 体动:%.2f 评分:%.1f 效率:%.2f REM占比:%.2f\n",
-                       stage_to_str(last->stage),
-                       last->respiratory_rate_bpm,
-                       last->motion_index,
-                       report.sleep_score,
-                       report.sleep_efficiency,
-                       report.rem_ratio);
-            }
-        }
+        printf("╚════════════════════════════════════════╝\n");
 
         vTaskDelay(period);
     }
@@ -231,9 +342,24 @@ static void uart_rx_task(void *pvParameters)
         uart_write_bytes(USART_UX, (const char *)tx_buf, tx_len);
         printf("已发送心率使能命令\n");
     }
+    
+    /* 体动查询定时器 (每3秒查询一次) */
+    TickType_t last_motion_query = xTaskGetTickCount();
+    const TickType_t motion_query_period = pdMS_TO_TICKS(3000);
 
     while (1)
     {
+        /* 定时发送体动参数查询 */
+        if ((xTaskGetTickCount() - last_motion_query) >= motion_query_period)
+        {
+            tx_len = sizeof(tx_buf);
+            if (protocol_pack_motion_query(tx_buf, &tx_len) == 0)
+            {
+                uart_write_bytes(USART_UX, (const char *)tx_buf, tx_len);
+            }
+            last_motion_query = xTaskGetTickCount();
+        }
+
         uart_get_buffered_data_len(USART_UX, (size_t *)&len);
 
         if (len > 0)
@@ -249,118 +375,69 @@ static void uart_rx_task(void *pvParameters)
 
                 if (parse_res == 0)
                 {
+                    /* 
+                     * 只处理三种数据：心率、呼吸、体动
+                     * 其他帧静默忽略
+                     */
+                    
+                    /* 心率上报: 5359 85 02 0001 1B [心率] sum 5443 */
                     if (ctrl == CTRL_HEART_RATE && cmd == CMD_HEART_RATE_REPORT)
                     {
-                        if (data_len == 1)
+                        /* 数据格式: 1B + 心率值 */
+                        if (data_len >= 1)
                         {
-                            uint8_t heart_rate = data_ptr[0];
-                            g_heart_rate = heart_rate;
-                            printf("心率: %d bpm\n", heart_rate);
+                            /* 检查是否有0x1B前缀 */
+                            uint8_t heart_rate = (data_len == 2 && data_ptr[0] == DATA_REPORT) 
+                                                 ? data_ptr[1] : data_ptr[0];
+                            if (heart_rate >= 60 && heart_rate <= 120)
+                            {
+                                g_heart_rate = heart_rate;
+                                /* 累积用于计算平均值 */
+                                g_hr_accum += (float)heart_rate;
+                                g_hr_samples++;
+                                printf("心率: %d bpm\n", heart_rate);
+                            }
                         }
                     }
-                    else if (ctrl == CTRL_HEART_RATE && cmd == CMD_HEART_RATE_SWITCH)
+                    /* 呼吸上报: 5359 81 02 0001 1B [呼吸] sum 5443 */
+                    else if (ctrl == CTRL_BREATH && cmd == CMD_BREATH_VALUE)
                     {
-                        printf("收到心率开关响应\n");
-                    }
-                    else if (ctrl == CTRL_HUMAN_PRESENCE)
-                    {
-                        switch (cmd)
+                        if (data_len >= 1)
                         {
-                        case CMD_BODY_MOVEMENT:
-                            if (data_len == 1)
+                            uint8_t breath = (data_len == 2 && data_ptr[0] == DATA_REPORT) 
+                                             ? data_ptr[1] : data_ptr[0];
+                            if (breath <= 35)
                             {
-                                uint8_t movement = data_ptr[0];
+                                g_breathing_rate = breath;
+                                /* 累积用于计算平均值（只累积有效值） */
+                                if (breath > 0)
+                                {
+                                    g_rr_accum += (float)breath;
+                                    g_rr_samples++;
+                                    printf("呼吸频率: %d 次/分\n", breath);
+                                }
+                            }
+                        }
+                    }
+                    /* 体动回复: 5359 80 83 0001 1B [体动] sum 5443 */
+                    else if (ctrl == CTRL_HUMAN_PRESENCE && cmd == CMD_BODY_MOVEMENT)
+                    {
+                        if (data_len >= 1)
+                        {
+                            uint8_t movement = (data_len == 2 && data_ptr[0] == DATA_REPORT) 
+                                               ? data_ptr[1] : data_ptr[0];
+                            if (movement <= 100)
+                            {
                                 g_motion_index = (float)movement;
                                 g_motion_accum += g_motion_index;
                                 g_motion_samples++;
                                 printf("体动参数: %d\n", movement);
                             }
-                            break;
-                        case CMD_MOTION_INFO:
-                            if (data_len == 1)
-                            {
-                                uint8_t motion = data_ptr[0];
-                                if (motion == 0x01) printf("运动信息: 静止\n");
-                                else if (motion == 0x02) printf("运动信息: 活跃\n");
-                                else printf("运动信息: 未知 (%02X)\n", motion);
-                            }
-                            break;
-                        default:
-                            printf("未知存在帧: Cmd=%02X\n", cmd);
-                            break;
                         }
                     }
-                    else if (ctrl == CTRL_BREATH && cmd == CMD_BREATH_VALUE)
-                    {
-                        if (data_len == 1)
-                        {
-                            uint8_t breath = data_ptr[0];
-                            g_breathing_rate = breath;
-                            printf("呼吸频率: %d 次/分\n", breath);
-                        }
-                    }
-                    else if (ctrl == CTRL_SLEEP)
-                    {
-                        if (cmd == CMD_SLEEP_COMPREHENSIVE)
-                        {
-                            if (data_len == 8)
-                            {
-                                printf("=== 睡眠综合状态 (10min) ===\n");
-                                printf("存在信息: %s\n", data_ptr[0] == 0x01 ? "有人" : "无人");
-
-                                const char *sleep_status = "未知";
-                                switch (data_ptr[1])
-                                {
-                                case 0x00: sleep_status = "深睡"; break;
-                                case 0x01: sleep_status = "浅睡"; break;
-                                case 0x02: sleep_status = "清醒"; break;
-                                case 0x03: sleep_status = "离床"; break;
-                                }
-                                printf("睡眠状态: %s\n", sleep_status);
-                                printf("平均呼吸: %d 次/分\n", data_ptr[2]);
-                                printf("平均心跳: %d 次/分\n", data_ptr[3]);
-                                printf("翻身次数: %d\n", data_ptr[4]);
-                                printf("大幅体动: %d%%\n", data_ptr[5]);
-                                printf("小幅体动: %d%%\n", data_ptr[6]);
-                                printf("呼吸暂停: %d\n", data_ptr[7]);
-                                printf("==========================\n");
-                            }
-                        }
-                        else if (cmd == CMD_SLEEP_QUALITY)
-                        {
-                            if (data_len == 12)
-                            {
-                                printf("=== 睡眠质量分析报告 (整晚) ===\n");
-                                printf("睡眠评分: %d 分\n", data_ptr[0]);
-                                uint16_t total_time = (data_ptr[1] << 8) | data_ptr[2];
-                                printf("睡眠时长: %d 分钟\n", total_time);
-                                printf("清醒占比: %d%%\n", data_ptr[3]);
-                                printf("浅睡占比: %d%%\n", data_ptr[4]);
-                                printf("深睡占比: %d%%\n", data_ptr[5]);
-                                printf("离床时长: %d 分钟\n", data_ptr[6]);
-                                printf("离床次数: %d 次\n", data_ptr[7]);
-                                printf("翻身次数: %d 次\n", data_ptr[8]);
-                                printf("平均呼吸: %d 次/分\n", data_ptr[9]);
-                                printf("平均心跳: %d 次/分\n", data_ptr[10]);
-                                printf("呼吸暂停: %d 次\n", data_ptr[11]);
-                                printf("=============================\n");
-                            }
-                        }
-                    }
-                    else
-                    {
-                        printf("未知帧: Ctrl=%02X, Cmd=%02X\n", ctrl, cmd);
-                    }
+                    /* 其他帧静默忽略，不打印 */
                 }
-                else
-                {
-                    printf("原始数据: ");
-                    for (int i = 0; i < rx_len; i++)
-                    {
-                        printf("%02X ", rx_buf[i]);
-                    }
-                    printf("\n");
-                }
+                /* 解析失败也静默忽略 */
             }
         }
 
